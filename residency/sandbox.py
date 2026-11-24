@@ -12,6 +12,8 @@ from .store import AppError
 
 
 class IdentitySandbox:
+    event_type = HostEvent
+
     def __init__(self, server, agent_limit=3, minimum_agents=None):
         self.server = server
         self.agent_limit=agent_limit
@@ -58,7 +60,7 @@ class IdentitySandbox:
             event.personas = personas
             for member in personas:event.wakes.setdefault(member,threading.Event())
             return
-        event = HostEvent(self.server, self.owner, personas, self.server.settings.data_dir/'host-event', host_is_observer=True, resident_limit=self.agent_limit)
+        event = self.event_type(self.server, self.owner, personas, self.server.settings.data_dir/'host-event', host_is_observer=True, resident_limit=self.agent_limit)
         with self.server.store.db() as db:
             npc = db.execute("SELECT value FROM metadata WHERE key='sandbox_npc'").fetchone()
         npc_id = npc[0] if npc else self._member('Facilitator NPC', 'Disclosed test facilitator. Asks occasional questions about repeated agreement or concentrated attention; it only reads messages after joining.')
@@ -173,7 +175,7 @@ class IdentitySandbox:
             if not self.server.event:
                 raise AppError('Save all three agent identities and their introductions before Start', 409)
             wallets=[self.accounts.wallet(owner) for owner in self.server.event.personas]
-            if (self.server.settings.hermes_model=='gpt-5.6-terra' or any(wallet is not None for wallet in wallets)) and any(wallet is None for wallet in wallets):
+            if self.accounts.enforces_allowances and (self.server.settings.hermes_model=='gpt-5.6-terra' or any(wallet is not None for wallet in wallets)) and any(wallet is None for wallet in wallets):
                 raise AppError('Set a USD allowance for each of the three agents in My agents before Start',409)
             cycle=getattr(self.server,'cycle',None)
             use_cycle=payload.get('seven_days',False)

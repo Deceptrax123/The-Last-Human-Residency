@@ -5,6 +5,7 @@ Construction is idle. Own derived notes enter model context only when allowed.
 import json
 import os
 from pathlib import Path
+import random
 import threading
 import time
 import uuid
@@ -212,9 +213,14 @@ class HostEvent:
                 for key in ('event_id','started_at','calls','completed_calls','message_count','starting_identities','npc_questions','agent_restarts','budget_pauses'):
                     if key in previous:self.state[key]=previous[key]
                 self.state['max_calls']=None if maximum is None else previous['calls']+maximum
+            seed = previous.get('seed') if previous else getattr(self.server, 'event_seed', None)
+            workers = list(self.personas)
+            if seed is not None:
+                random.Random(seed).shuffle(workers)
+                self.state.update(seed=seed, worker_launch_order=workers)
             self.active = len(self.personas)
             self._save()
-            self.member_threads = {member:threading.Thread(target=self._worker,args=(member,),name='resident:'+member,daemon=True) for member in self.personas}
+            self.member_threads = {member:threading.Thread(target=self._worker,args=(member,),name='resident:'+member,daemon=True) for member in workers}
             self.threads = list(self.member_threads.values())
             if self.npc and self.npc.enabled:
                 self.threads.append(threading.Thread(target=self._npc_worker,daemon=True))
@@ -243,7 +249,7 @@ class HostEvent:
     def resume(self, actor):
         if actor!=self.host_id:raise AppError('Only the host can resume networking',403)
         with self.lock:
-            if self.state.get('status') not in ('paused_quota','stopped','interrupted','failed','completed_with_errors') or not self.state.get('event_id'):
+            if self.state.get('status') not in ('paused_quota','paused_worker_error','stopped','interrupted','failed','completed_with_errors') or not self.state.get('event_id'):
                 raise AppError('Resume requires an existing paused event',409)
             if self.active or any(t.is_alive() for t in self.threads):raise AppError('Wait for in-flight calls to settle before resuming',409)
             if not self.board_seen and self.state.get('calls',0) and getattr(getattr(self.server,'sandbox',None),'accounts',None):
@@ -455,13 +461,16 @@ class HostEvent:
             result['coverage']['history_included']=len(result['recent_messages'])
         return result
 
+    def instructions(self, member=None):
+        return SYSTEM+(CONTINUITY_INSTRUCTIONS if getattr(self.server,'continue_existing_rooms',False) else '')+(TOOL_INSTRUCTIONS if getattr(self.server,'agent_tools',None) else '')
+
     def _decision(self, member, call, context):
         self.server.hermes.check()
         event_id = self.state['event_id']
         scope = f'residency:{self.server.store.instance_id}:event:{event_id}:member:{member}:call:{call}'
         payload={
             'model':self.server.settings.hermes_model, 'stream':False,
-            'messages':[{'role':'system','content':SYSTEM+(CONTINUITY_INSTRUCTIONS if getattr(self.server,'continue_existing_rooms',False) else '')+(TOOL_INSTRUCTIONS if getattr(self.server,'agent_tools',None) else '')}, {'role':'user','content':json.dumps(context,ensure_ascii=False)}]
+            'messages':[{'role':'system','content':self.instructions(member)}, {'role':'user','content':json.dumps(context,ensure_ascii=False)}]
         }
         if self.server.settings.hermes_reasoning_effort:payload['model_options']={'reasoning':{'effort':self.server.settings.hermes_reasoning_effort}}
         audit=getattr(self.server,'audit_directory',None)
@@ -546,6 +555,19 @@ class HostEvent:
                     for wake in self.wakes.values(): wake.set()
                 self._save()
 
+    def dispatch_allowed(self, member):
+        """Optional experiment-specific wall-clock gate."""
+        return True
+
+    def recover_action_error(self, member, call, error):
+        return False
+
+    def action_succeeded(self, member, call):
+        pass
+
+    def worker_failed(self, member, call, error):
+        pass
+
     def _worker(self, member):
         delay=0
         first=True
@@ -561,7 +583,7 @@ class HostEvent:
                     entry=None;call=None
                     accounts=getattr(getattr(self.server,'sandbox',None),'accounts',None)
                     with self.lock:
-                        if self.stop_flag.is_set(): break
+                        if self.stop_flag.is_set() or not self.dispatch_allowed(member): break
                         if self.state['max_calls'] is not None and self.state['calls']>=self.state['max_calls']:
                             break
                         call=self.state['calls']+1
@@ -579,10 +601,19 @@ class HostEvent:
                     context=self.context(member)
                     if entry and 'budget' in context:context['budget']['phase']=entry['purpose'] if entry['purpose']=='wrap_up' else 'ready'
                     if accounts:accounts.context_links(entry,context)
-                    action=self._decision(member,call,context)
-                    payload,delay=self.validate(member,action)
+                    try:
+                        action=self._decision(member,call,context)
+                        payload,delay=self.validate(member,action)
+                    except AppError as exc:
+                        # Recovery is opt-in and happens before any conversation
+                        # or tool action is applied. Every new attempt has its
+                        # own call ID, provider receipt and usage entry.
+                        if self.recover_action_error(member,call,exc):
+                            delay=0
+                            continue
+                        raise
                     with self.lock:
-                        if self.stop_flag.is_set(): break
+                        if self.stop_flag.is_set() or not self.dispatch_allowed(member): break
                         result=self.server.store.conversation_action(member,payload,
                             **({'reuse_direct_rooms':set(self.rooms)} if getattr(self.server,'continue_existing_rooms',False) else {}))
                         if accounts:
@@ -593,13 +624,14 @@ class HostEvent:
                         self.state['completed_calls']+=1
                         self.state['message_count']+=len(result['messages'])
                         self.state['thinking'].remove(member)
+                        self.action_succeeded(member,call)
                         if self.state['max_calls'] is not None and self.state['completed_calls']>=self.state['max_calls']:
                             self.stop_flag.set()
                             for wake in self.wakes.values(): wake.set()
                             self.npc_wake.set()
                         self._save()
                     self.server.capture_conversations(result['affected_members'])
-                    if action.get('tool_calls') and self.state['status']=='running':
+                    if action.get('tool_calls') and self.state['status']=='running' and self.dispatch_allowed(member):
                         self.server.agent_tools.run(member,call,action['tool_calls'])
                     self.notify(set(result['affected_members'])-{member})
                     if accounts and ((entry and entry['purpose']=='wrap_up') or action.get('budget_choice') in ('end','wrap_up')):
@@ -626,6 +658,7 @@ class HostEvent:
                 message=str(exc) if isinstance(exc,AppError) else 'Agent failed unexpectedly; no automatic retry was made'
                 if getattr(self.server,'resilient_events',False):
                     self.state.setdefault('agent_errors',{})[member]=message
+                    self.worker_failed(member,call,exc)
                 else:
                     self.state['status']='failed';self.state['error']=message
                     self.stop_flag.set()
@@ -642,7 +675,7 @@ class HostEvent:
                 if self.active==0:
                     self.stop_flag.set()
                     self.npc_wake.set()
-                    if self.state['status'] not in ('failed','paused_quota'):
+                    if self.state['status'] not in ('failed','paused_quota','paused_worker_error'):
                         maximum=self.state['max_calls']
                         completed=(maximum is None and self.state['status']!='stopping') or (maximum is not None and self.state['completed_calls']>=maximum)
                         self.state['status']='completed_with_errors' if self.state.get('agent_errors') else 'completed' if completed else 'stopped'
