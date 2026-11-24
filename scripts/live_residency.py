@@ -46,10 +46,9 @@ def pid():
     except (OSError,KeyError,ValueError):return None
 
 
-def run(seed=None):
+def run():
     os.umask(0o077)
     server=ResidencyServer(('127.0.0.1',7380),config())
-    server.event_seed=seed
     private_json(DATA/'process.json',{'pid':os.getpid()})
     server.audit_directory=DATA/'audit';server.network_memory_enabled=True;server.bounded_context=True;server.resilient_events=True
     server.continue_existing_rooms=True
@@ -75,27 +74,15 @@ def run(seed=None):
 
 
 def main():
-    global DATA
-    parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command',choices=('setup','start','run','status','stop'))
-    parser.add_argument('--data-directory',type=Path,default=DATA)
-    parser.add_argument('--seed',type=int,help='Shuffle the order in which resident workers are launched')
-    args=parser.parse_args()
-    DATA=args.data_directory.resolve()
-    if DATA==ROOT or not DATA.is_relative_to(ROOT):
-        parser.error('--data-directory must be inside residency_app')
-    if args.seed is not None and args.command not in ('start','run'):
-        parser.error('--seed is only used with start or run')
-    if args.command=='run':return run(args.seed)
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('command',choices=('setup','start','run','status','stop'));args=parser.parse_args()
+    if args.command=='run':return run()
     setup()
     if args.command=='setup':result={'configured':True,'model':config().hermes_model,'host_invitation_file':str(DATA/'setup.json'),'max_residents':setup()['agent_limit'],'model_calls':0}
     elif args.command=='start':
         if pid():raise SystemExit('Live residency is already running')
-        command=[sys.executable,'-B',str(Path(__file__).resolve()),'run','--data-directory',str(DATA)]
-        if args.seed is not None:command.extend(['--seed',str(args.seed)])
-        with (DATA/'app.log').open('ab') as log:child=subprocess.Popen(command,cwd=ROOT,env=hermes.environment(),stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+        with (DATA/'app.log').open('ab') as log:child=subprocess.Popen([sys.executable,'-B',str(Path(__file__).resolve()),'run'],cwd=ROOT,env=hermes.environment(),stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
         private_json(DATA/'process.json',{'pid':child.pid});time.sleep(1)
-        if child.poll() is not None:raise SystemExit(f'Startup failed; inspect {DATA / "app.log"}')
+        if child.poll() is not None:raise SystemExit('Startup failed; inspect .data/live-residency/app.log')
         result={'running':True,'url':'http://127.0.0.1:7380','event_started':False}
     elif args.command=='stop':
         current=pid()

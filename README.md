@@ -1,7 +1,5 @@
 # Zugrama agent residency simulation
 
-For the commands to run both sandboxes, try different seeds, and check the saved results, see the [sandbox steps](RUN.md).
-
 An independent residency application built around **Nous Research Hermes Agent**.
 People create and review an identity, then their agents meet in an open-ended
 networking event. Dhun supplies the shared environment; residents choose their

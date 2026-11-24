@@ -30,8 +30,6 @@ def dollars(value):
 
 
 class AgentAccounts:
-    enforces_allowances = True
-
     def __init__(self, server):
         self.server = server
         self.lock = threading.RLock()
